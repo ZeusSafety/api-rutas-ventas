@@ -3,12 +3,14 @@ Microservicio de Monitoreo de Flota — Flask + WebSockets
 Desplegar en Google Cloud Run (carpeta flota-service/, independiente del frontend).
 """
 import json
+import logging
 import os
 import threading
 from datetime import date, datetime
 from decimal import Decimal
 
 import pymysql
+logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -41,15 +43,37 @@ MAX_GPS_PRECISION_M = 50
 
 
 def get_db():
+    host = os.getenv("DB_HOST")
+    if not host:
+        raise RuntimeError(
+            "DB_HOST no configurado en Cloud Run. Agregue DB_HOST, DB_USER, DB_PASSWORD, DB_NAME."
+        )
     return pymysql.connect(
-        host=os.getenv("DB_HOST", "localhost"),
+        host=host,
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASSWORD", ""),
         database=os.getenv("DB_NAME", "zeus"),
         port=int(os.getenv("DB_PORT", "3306")),
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
+        connect_timeout=15,
+        read_timeout=30,
+        write_timeout=30,
     )
+
+
+def db_error_response(exc):
+    """Respuesta JSON clara cuando falla MySQL (config o tablas)."""
+    logger.exception("Error de base de datos")
+    msg = str(exc)
+    hint = "Configure DB_HOST, DB_USER, DB_PASSWORD, DB_NAME en Cloud Run."
+    if "doesn't exist" in msg.lower() or "1146" in msg:
+        hint = "Ejecute database/migrations.sql en su MySQL."
+    elif "Access denied" in msg or "1045" in msg:
+        hint = "Usuario o contraseña MySQL incorrectos (DB_USER / DB_PASSWORD)."
+    elif "Can't connect" in msg or "2003" in msg:
+        hint = "Cloud Run no alcanza MySQL: use IP pública de Cloud SQL o VPC connector."
+    return jsonify({"error": "Error de base de datos", "detail": msg, "hint": hint}), 503
 
 
 def serialize_row(row):
@@ -120,21 +144,40 @@ def health():
     return jsonify({"status": "ok", "service": "flota-service"})
 
 
+@app.route("/api/health/db", methods=["GET"])
+def health_db():
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+        finally:
+            conn.close()
+        return jsonify({"status": "ok", "database": "connected"})
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+
+
 # ─── Conductores ──────────────────────────────────────────────────────────────
 
 @app.route("/api/conductores", methods=["GET"])
 def list_conductores():
-    conn = get_db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, nombre, telefono, placa_vehiculo AS placa, tipo_vehiculo
-                   FROM conductores WHERE activo = 1 ORDER BY nombre"""
-            )
-            rows = cur.fetchall()
-        return jsonify([serialize_row(r) for r in rows])
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, nombre, telefono, placa_vehiculo AS placa, tipo_vehiculo
+                       FROM conductores WHERE activo = 1 ORDER BY nombre"""
+                )
+                rows = cur.fetchall()
+            return jsonify([serialize_row(r) for r in rows])
+        finally:
+            conn.close()
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
 
 
 # ─── Sesiones GPS ─────────────────────────────────────────────────────────────
