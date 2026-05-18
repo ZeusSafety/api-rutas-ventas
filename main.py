@@ -1,3 +1,7 @@
+"""
+Microservicio de Monitoreo de Flota — Flask + WebSockets
+Desplegar en Google Cloud Run (carpeta flota-service/, independiente del frontend).
+"""
 import json
 import os
 import threading
@@ -14,6 +18,15 @@ load_dotenv()
 
 app = Flask(__name__)
 sock = Sock(app)
+
+# Cloud Run health check / verificación rápida sin MySQL
+@app.route("/")
+def root():
+    return jsonify({
+        "service": "api-rutas-ventas",
+        "modulo": "monitoreo-flota",
+        "status": "ok",
+    })
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -439,18 +452,17 @@ def ws_conductor(ws, conductor_id):
         pass
 
 
+# Solo para despliegue con functions-framework (Cloud Functions HTTP simple, sin WebSockets).
+# En Cloud Run usar Gunicorn (ver Dockerfile).
 try:
     import functions_framework
-except ImportError:
-    functions_framework = None
-
-if functions_framework:
 
     @functions_framework.http
     def flota_zeus(request):
-        """Punto de entrada HTTP (mismo patrón que API-RUTAS-VENTAS / boletas_zeus)."""
         with app.request_context(request.environ):
             return app.full_dispatch_request()
+except ImportError:
+    pass
 
 
 if __name__ == "__main__":
