@@ -1,6 +1,7 @@
 # Microservicio flota — Cloud Run (sin weasyprint/pdfplumber: no se usan en main.py y rompen el arranque en slim)
 flask==3.0.0
 flask-sock==0.7.0
+simple-websocket>=1.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
 python-dotenv==1.0.0
