@@ -1,0 +1,17 @@
+# Microservicio flota (Cloud Run) + dependencias compartidas con otros backends ZEUS
+flask==3.0.0
+flask-sock==0.7.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+python-dotenv==1.0.0
+
+functions-framework==3.*
+pymysql==1
+PyJWT==2
+google-cloud-storage
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+requests==2.*
+pdfplumber==0.10.4
+weasyprint==60.2
