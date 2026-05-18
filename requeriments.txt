@@ -1,4 +1,3 @@
-# Microservicio flota (Cloud Run) + dependencias compartidas con otros backends ZEUS
 flask==3.0.0
 flask-sock==0.7.0
 flask-cors==4.0.0
