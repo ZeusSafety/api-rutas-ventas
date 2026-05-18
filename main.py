@@ -43,22 +43,41 @@ MAX_GPS_PRECISION_M = 50
 
 
 def get_db():
-    host = os.getenv("DB_HOST")
-    if not host:
-        raise RuntimeError(
-            "DB_HOST no configurado en Cloud Run. Agregue DB_HOST, DB_USER, DB_PASSWORD, DB_NAME."
-        )
-    return pymysql.connect(
-        host=host,
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", ""),
-        database=os.getenv("DB_NAME", "zeus"),
-        port=int(os.getenv("DB_PORT", "3306")),
+    user = os.getenv("DB_USER", "root")
+    password = os.getenv("DB_PASSWORD", "")
+    database = os.getenv("DB_NAME", "Zeus_Safety_Data_Integration")
+    common = dict(
+        user=user,
+        password=password,
+        database=database,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
         connect_timeout=15,
         read_timeout=30,
         write_timeout=30,
+    )
+
+    # Cloud Run + Cloud SQL (socket montado en /cloudsql/...)
+    cloud_instance = os.getenv("CLOUD_SQL_CONNECTION_NAME", "").strip()
+    host = (os.getenv("DB_HOST") or "").strip()
+
+    if cloud_instance:
+        socket_path = f"/cloudsql/{cloud_instance}"
+        return pymysql.connect(unix_socket=socket_path, **common)
+
+    if host.startswith("/cloudsql"):
+        return pymysql.connect(unix_socket=host, **common)
+
+    if not host:
+        raise RuntimeError(
+            "Configure CLOUD_SQL_CONNECTION_NAME (Cloud Run) o DB_HOST (local con proxy)."
+        )
+
+    # Local: cloud-sql-proxy en 127.0.0.1:3306
+    return pymysql.connect(
+        host=host,
+        port=int(os.getenv("DB_PORT", "3306")),
+        **common,
     )
 
 
