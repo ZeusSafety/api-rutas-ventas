@@ -729,6 +729,146 @@ def paradas_ruta(ruta_id):
         conn.close()
 
 
+def _get_ruta_row(cur, ruta_id):
+    cur.execute(
+        """SELECT r.id, r.nombre_ruta, r.descripcion, r.fecha_asignacion, r.estado, r.color,
+                  r.vehiculo_id, r.conductor_id, r.created_at,
+                  v.nombre AS vehiculo_nombre, v.placa AS vehiculo_placa,
+                  c.nombre AS conductor_nombre,
+                  (SELECT COUNT(*) FROM paradas_ruta p WHERE p.ruta_id = r.id) AS total_paradas
+           FROM rutas_asignadas r
+           LEFT JOIN vehiculos v ON v.id = r.vehiculo_id
+           LEFT JOIN conductores c ON c.id = r.conductor_id
+           WHERE r.id = %s""",
+        (ruta_id,),
+    )
+    return cur.fetchone()
+
+
+@app.route("/api/ruta/<int:ruta_id>", methods=["GET"])
+def obtener_ruta_detalle(ruta_id):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            ruta = _get_ruta_row(cur, ruta_id)
+            if not ruta:
+                return jsonify({"error": "Ruta no encontrada"}), 404
+            paradas = _fetch_paradas_ruta(cur, ruta_id)
+        out = serialize_row(ruta)
+        out["paradas"] = paradas
+        return jsonify(out)
+    finally:
+        conn.close()
+
+
+@app.route("/api/ruta/<int:ruta_id>", methods=["PUT"])
+def actualizar_ruta(ruta_id):
+    data = request.get_json() or {}
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            ruta = _get_ruta_row(cur, ruta_id)
+            if not ruta:
+                return jsonify({"error": "Ruta no encontrada"}), 404
+            estado = (ruta.get("estado") or "pendiente").lower()
+
+            if estado == "completada":
+                return jsonify({"error": "Ruta completada: no se puede modificar"}), 403
+
+            if estado == "en_curso":
+                descripcion = data.get("descripcion")
+                if descripcion is None and not data.get("nombre_ruta"):
+                    return jsonify({"error": "Solo puede actualizar descripción u observaciones"}), 400
+                cur.execute(
+                    """UPDATE rutas_asignadas SET descripcion = %s WHERE id = %s""",
+                    (descripcion, ruta_id),
+                )
+                if data.get("nombre_ruta"):
+                    cur.execute(
+                        "UPDATE rutas_asignadas SET nombre_ruta = %s WHERE id = %s",
+                        ((data.get("nombre_ruta") or "").strip(), ruta_id),
+                    )
+                return jsonify({"ok": True, "ruta_id": ruta_id, "modo": "parcial"})
+
+            vehiculo_id = data.get("vehiculo_id", ruta["vehiculo_id"])
+            conductor_id = data.get("conductor_id", ruta["conductor_id"])
+            nombre_ruta = (data.get("nombre_ruta") or ruta["nombre_ruta"] or "").strip()
+            fecha = data.get("fecha", ruta["fecha_asignacion"])
+            paradas = data.get("paradas")
+
+            if not nombre_ruta:
+                return jsonify({"error": "nombre_ruta requerido"}), 400
+
+            cur.execute(
+                """UPDATE rutas_asignadas
+                   SET vehiculo_id = %s, conductor_id = %s, nombre_ruta = %s,
+                       descripcion = %s, fecha_asignacion = %s
+                   WHERE id = %s""",
+                (
+                    vehiculo_id,
+                    conductor_id,
+                    nombre_ruta,
+                    data.get("descripcion"),
+                    fecha,
+                    ruta_id,
+                ),
+            )
+            if fecha and vehiculo_id and conductor_id:
+                cur.execute(
+                    """INSERT INTO asignaciones_conductor (vehiculo_id, conductor_id, fecha_asignacion)
+                       VALUES (%s, %s, %s)
+                       ON DUPLICATE KEY UPDATE conductor_id = VALUES(conductor_id)""",
+                    (vehiculo_id, conductor_id, fecha),
+                )
+
+            if paradas is not None:
+                if not paradas:
+                    return jsonify({"error": "Agregue al menos una parada"}), 400
+                cur.execute("DELETE FROM paradas_ruta WHERE ruta_id = %s", (ruta_id,))
+                for i, p in enumerate(paradas):
+                    cur.execute(
+                        """INSERT INTO paradas_ruta
+                           (ruta_id, nombre_ferreteria, direccion, latitud, longitud, orden)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (
+                            ruta_id,
+                            p.get("nombre_ferreteria") or p.get("nombre") or f"Parada {i + 1}",
+                            p.get("direccion"),
+                            p.get("latitud") or p.get("lat"),
+                            p.get("longitud") or p.get("lng"),
+                            p.get("orden", i + 1),
+                        ),
+                    )
+
+        return jsonify({"ok": True, "ruta_id": ruta_id})
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+    finally:
+        conn.close()
+
+
+@app.route("/api/ruta/<int:ruta_id>", methods=["DELETE"])
+def eliminar_ruta(ruta_id):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            ruta = _get_ruta_row(cur, ruta_id)
+            if not ruta:
+                return jsonify({"error": "Ruta no encontrada"}), 404
+            estado = (ruta.get("estado") or "pendiente").lower()
+            if estado != "pendiente":
+                return jsonify({
+                    "error": "Solo se pueden eliminar rutas en estado pendiente",
+                    "estado": estado,
+                }), 403
+            cur.execute("DELETE FROM paradas_ruta WHERE ruta_id = %s", (ruta_id,))
+            cur.execute("DELETE FROM rutas_asignadas WHERE id = %s", (ruta_id,))
+        return jsonify({"ok": True, "ruta_id": ruta_id})
+    finally:
+        conn.close()
+
+
 # ─── Reportes de visita (foto + venta) ──────────────────────────────────────────
 
 @app.route("/api/reporte/visita", methods=["POST"])
