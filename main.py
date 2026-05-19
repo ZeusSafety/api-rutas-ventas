@@ -185,6 +185,63 @@ def estado_conductor(velocidad, ultimo_update_iso):
     return "en_ruta"
 
 
+RESULTADOS_VISITA = frozenset({"vendio", "no_estaba", "reagendar"})
+
+SQL_PARADAS_RUTA = """
+    SELECT p.id, p.nombre_ferreteria, p.direccion, p.latitud, p.longitud, p.orden,
+           (SELECT COUNT(*) FROM reportes_visita rv WHERE rv.parada_id = p.id) AS visitado,
+           (SELECT CASE
+                WHEN rv.vendio = 1 THEN 'vendio'
+                WHEN COALESCE(rv.observaciones, '') LIKE '[no_estaba]%' THEN 'no_estaba'
+                WHEN COALESCE(rv.observaciones, '') LIKE '[reagendar]%' THEN 'reagendar'
+                WHEN COALESCE(rv.observaciones, '') LIKE '[vendio]%' THEN 'vendio'
+                ELSE NULL
+            END
+            FROM reportes_visita rv
+            WHERE rv.parada_id = p.id
+            ORDER BY rv.timestamp DESC LIMIT 1) AS resultado_visita,
+           (SELECT rv.vendio FROM reportes_visita rv
+            WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS vendio,
+           (SELECT rv.foto_url FROM reportes_visita rv
+            WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS foto_url
+    FROM paradas_ruta p WHERE p.ruta_id = %s ORDER BY p.orden
+"""
+
+
+def _resultado_desde_payload(data):
+    r = (data.get("resultado") or data.get("resultado_visita") or "").strip().lower()
+    if r in RESULTADOS_VISITA:
+        return r
+    if data.get("vendio") is True:
+        return "vendio"
+    if data.get("vendio") is False:
+        return "no_estaba"
+    return None
+
+
+def _observaciones_con_resultado(resultado, observaciones):
+    obs = (observaciones or "").strip()
+    for tag in ("[vendio]", "[no_estaba]", "[reagendar]"):
+        if obs.startswith(tag):
+            obs = obs[len(tag) :].strip()
+    prefix = {
+        "vendio": "[vendio]",
+        "no_estaba": "[no_estaba]",
+        "reagendar": "[reagendar]",
+    }[resultado]
+    return f"{prefix} {obs}".strip() if obs else prefix
+
+
+def _fetch_paradas_ruta(cur, ruta_id):
+    cur.execute(SQL_PARADAS_RUTA, (ruta_id,))
+    out = []
+    for p in cur.fetchall():
+        row = serialize_row(p)
+        row["visitado"] = bool(row.get("visitado"))
+        out.append(row)
+    return out
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/health", methods=["GET"])
@@ -252,6 +309,29 @@ def list_vehiculos():
     except Exception as e:
         body, code = db_error_response(e)
         return body, code
+
+
+@app.route("/api/vehiculo/<int:vehiculo_id>/conductores-hoy", methods=["GET"])
+def conductores_vehiculo_hoy(vehiculo_id):
+    """Conductores asignados al vehículo en la fecha indicada (app conductor)."""
+    fecha = request.args.get("fecha", date.today().isoformat())
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.id, c.nombre, c.telefono, c.placa, c.activo,
+                          ac.fecha_asignacion, v.nombre AS vehiculo_nombre
+                   FROM asignaciones_conductor ac
+                   JOIN conductores c ON c.id = ac.conductor_id AND c.activo = 1
+                   JOIN vehiculos v ON v.id = ac.vehiculo_id
+                   WHERE ac.vehiculo_id = %s AND ac.fecha_asignacion = %s
+                   ORDER BY c.nombre""",
+                (vehiculo_id, fecha),
+            )
+            rows = cur.fetchall()
+        return jsonify([serialize_row(r) for r in rows])
+    finally:
+        conn.close()
 
 
 @app.route("/api/flota/en-vivo", methods=["GET"])
@@ -450,22 +530,10 @@ def ruta_asignada_vehiculo_hoy(vehiculo_id):
                 (vehiculo_id, fecha),
             )
             ruta = cur.fetchone()
-            paradas = []
-            if ruta:
-                cur.execute(
-                    """SELECT p.id, p.nombre_ferreteria, p.direccion, p.latitud, p.longitud, p.orden,
-                              (SELECT COUNT(*) FROM reportes_visita rv WHERE rv.parada_id = p.id) AS visitado,
-                              (SELECT rv.vendio FROM reportes_visita rv
-                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS vendio,
-                              (SELECT rv.foto_url FROM reportes_visita rv
-                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS foto_url
-                       FROM paradas_ruta p WHERE p.ruta_id = %s ORDER BY p.orden""",
-                    (ruta["id"],),
-                )
-                paradas = cur.fetchall()
+            paradas = _fetch_paradas_ruta(cur, ruta["id"]) if ruta else []
         return jsonify({
             "ruta": serialize_row(ruta) if ruta else None,
-            "paradas": [serialize_row(p) for p in paradas],
+            "paradas": paradas,
         })
     finally:
         conn.close()
@@ -535,6 +603,43 @@ def finalizar_sesion():
         conn.close()
 
 
+@app.route("/api/sesion/puntos-batch", methods=["POST"])
+def puntos_gps_batch():
+    """Sincroniza puntos GPS guardados offline en la app conductor."""
+    data = request.get_json() or {}
+    sesion_id = data.get("sesion_id")
+    conductor_id = data.get("conductor_id")
+    puntos = data.get("puntos") or []
+    if not sesion_id or not conductor_id:
+        return jsonify({"error": "sesion_id y conductor_id requeridos"}), 400
+    if not isinstance(puntos, list) or not puntos:
+        return jsonify({"ok": True, "insertados": 0})
+
+    insertados = 0
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            for pt in puntos[:500]:
+                lat = pt.get("lat")
+                lng = pt.get("lng")
+                if lat is None or lng is None:
+                    continue
+                precision = float(pt.get("precision", 0) or 0)
+                if precision > MAX_GPS_PRECISION_M and precision > 0:
+                    continue
+                velocidad = float(pt.get("velocidad", 0) or 0)
+                cur.execute(
+                    """INSERT INTO puntos_gps
+                       (sesion_id, conductor_id, latitud, longitud, velocidad, precision_gps)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (sesion_id, conductor_id, lat, lng, velocidad, precision),
+                )
+                insertados += 1
+        return jsonify({"ok": True, "insertados": insertados})
+    finally:
+        conn.close()
+
+
 # ─── Historial GPS ────────────────────────────────────────────────────────────
 
 @app.route("/api/ruta/historial/<int:sesion_id>", methods=["GET"])
@@ -599,22 +704,10 @@ def ruta_asignada_hoy(conductor_id):
                 (conductor_id, fecha),
             )
             ruta = cur.fetchone()
-            paradas = []
-            if ruta:
-                cur.execute(
-                    """SELECT p.id, p.nombre_ferreteria, p.direccion, p.latitud, p.longitud, p.orden,
-                              (SELECT COUNT(*) FROM reportes_visita rv WHERE rv.parada_id = p.id) AS visitado,
-                              (SELECT rv.vendio FROM reportes_visita rv
-                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS vendio,
-                              (SELECT rv.foto_url FROM reportes_visita rv
-                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS foto_url
-                       FROM paradas_ruta p WHERE p.ruta_id = %s ORDER BY p.orden""",
-                    (ruta["id"],),
-                )
-                paradas = cur.fetchall()
+            paradas = _fetch_paradas_ruta(cur, ruta["id"]) if ruta else []
         return jsonify({
             "ruta": serialize_row(ruta) if ruta else None,
-            "paradas": [serialize_row(p) for p in paradas],
+            "paradas": paradas,
         })
     finally:
         conn.close()
@@ -645,26 +738,53 @@ def crear_reporte_visita():
     if not all(data.get(k) for k in required):
         return jsonify({"error": "parada_id y conductor_id requeridos"}), 400
 
+    resultado = _resultado_desde_payload(data)
+    if not resultado:
+        return jsonify({"error": "resultado inválido (vendio, no_estaba, reagendar)"}), 400
+
+    vendio = resultado == "vendio"
+    observaciones = _observaciones_con_resultado(resultado, data.get("observaciones"))
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO reportes_visita
-                   (parada_id, conductor_id, sesion_id, vendio, monto_venta, observaciones,
-                    foto_url, latitud, longitud)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    data["parada_id"],
-                    data["conductor_id"],
-                    data.get("sesion_id"),
-                    bool(data.get("vendio", False)),
-                    data.get("monto_venta"),
-                    data.get("observaciones"),
-                    data.get("foto_url"),
-                    data.get("lat"),
-                    data.get("lng"),
-                ),
-            )
+            try:
+                cur.execute(
+                    """INSERT INTO reportes_visita
+                       (parada_id, conductor_id, sesion_id, vendio, resultado_visita,
+                        monto_venta, observaciones, foto_url, latitud, longitud)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        data["parada_id"],
+                        data["conductor_id"],
+                        data.get("sesion_id"),
+                        vendio,
+                        resultado,
+                        data.get("monto_venta"),
+                        observaciones,
+                        data.get("foto_url"),
+                        data.get("lat"),
+                        data.get("lng"),
+                    ),
+                )
+            except pymysql.err.OperationalError:
+                cur.execute(
+                    """INSERT INTO reportes_visita
+                       (parada_id, conductor_id, sesion_id, vendio, monto_venta, observaciones,
+                        foto_url, latitud, longitud)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        data["parada_id"],
+                        data["conductor_id"],
+                        data.get("sesion_id"),
+                        vendio,
+                        data.get("monto_venta"),
+                        observaciones,
+                        data.get("foto_url"),
+                        data.get("lat"),
+                        data.get("lng"),
+                    ),
+                )
             reporte_id = cur.lastrowid
             cur.execute(
                 """SELECT p.nombre_ferreteria, r.conductor_id
@@ -679,7 +799,8 @@ def crear_reporte_visita():
             "conductor_id": data["conductor_id"],
             "parada_id": data["parada_id"],
             "nombre_ferreteria": parada["nombre_ferreteria"] if parada else "",
-            "vendio": bool(data.get("vendio", False)),
+            "vendio": vendio,
+            "resultado": resultado,
             "foto_url": data.get("foto_url"),
         })
         return jsonify({"ok": True, "reporte_id": reporte_id})
