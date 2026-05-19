@@ -19,15 +19,20 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 ###########################################################
-# CONFIG DB (mismo patrón que ejemplo.py / otros backends ZEUS)
+# CONFIG DB — mismas variables que ejemplo.py + defaults como dashboard.py
 ###########################################################
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
-INSTANCE_CONNECTION_NAME = os.getenv("INSTANCE_CONNECTION_NAME")
+_DEFAULT_INSTANCE = "stable-smithy-435414-m6:us-central1:zeussafety-2024"
+
+DB_USER = os.getenv("DB_USER") or "zeussafety-2024"
+DB_PASSWORD = os.getenv("DB_PASSWORD") or "ZeusSafety2025"
+DB_NAME = os.getenv("DB_NAME") or "Zeus_Safety_Data_Integration"
 # Solo desarrollo local con cloud-sql-proxy:
-DB_HOST = os.getenv("DB_HOST")
+DB_HOST = (os.getenv("DB_HOST") or "").strip()
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
+
+
+def _instance_connection_name():
+    return (os.getenv("INSTANCE_CONNECTION_NAME") or "").strip() or _DEFAULT_INSTANCE
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -50,29 +55,24 @@ MAX_GPS_PRECISION_M = 50
 
 
 def get_connection():
-    """Igual que get_connection() en ejemplo.py — Cloud SQL por socket o TCP local."""
+    """Cloud SQL por socket (producción) o TCP con DB_HOST (proxy local)."""
     common = dict(
         user=DB_USER,
         password=DB_PASSWORD,
         db=DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
-        connect_timeout=15,
-        read_timeout=30,
-        write_timeout=30,
+        connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "20")),
+        read_timeout=int(os.getenv("DB_READ_TIMEOUT", "120")),
+        write_timeout=int(os.getenv("DB_WRITE_TIMEOUT", "120")),
     )
-
-    if INSTANCE_CONNECTION_NAME:
-        return pymysql.connect(
-            unix_socket=f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
-            **common,
-        )
 
     if DB_HOST:
         return pymysql.connect(host=DB_HOST, port=DB_PORT, **common)
 
-    raise RuntimeError(
-        "Defina INSTANCE_CONNECTION_NAME (Cloud Run) o DB_HOST (local + proxy)."
+    return pymysql.connect(
+        unix_socket=f"/cloudsql/{_instance_connection_name()}",
+        **common,
     )
 
 
@@ -93,9 +93,9 @@ def db_error_response(exc):
     """Respuesta JSON clara cuando falla MySQL (config o tablas)."""
     logger.exception("Error de base de datos")
     msg = str(exc)
-    hint = "Defina DB_USER, DB_PASSWORD, DB_NAME e INSTANCE_CONNECTION_NAME en Cloud Run."
+    hint = "Revise conexión Cloud SQL y credenciales MySQL."
     if "doesn't exist" in msg.lower() or "1146" in msg:
-        hint = "Ejecute database/migrations.sql en su MySQL."
+        hint = "La tabla no existe: ejecute database/migrations.sql en Zeus_Safety_Data_Integration."
     elif "Access denied" in msg or "1045" in msg:
         hint = "Usuario o contraseña MySQL incorrectos (DB_USER / DB_PASSWORD)."
     elif "Can't connect" in msg or "2003" in msg:
@@ -180,7 +180,12 @@ def health_db():
                 cur.execute("SELECT 1 AS ok")
         finally:
             conn.close()
-        return jsonify({"status": "ok", "database": "connected"})
+        return jsonify({
+            "status": "ok",
+            "database": "connected",
+            "db": DB_NAME,
+            "instance": _instance_connection_name(),
+        })
     except Exception as e:
         body, code = db_error_response(e)
         return body, code
