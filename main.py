@@ -187,25 +187,23 @@ def estado_conductor(velocidad, ultimo_update_iso):
 
 RESULTADOS_VISITA = frozenset({"vendio", "no_estaba", "reagendar"})
 
-SQL_PARADAS_RUTA = """
-    SELECT p.id, p.nombre_ferreteria, p.direccion, p.latitud, p.longitud, p.orden,
-           (SELECT COUNT(*) FROM reportes_visita rv WHERE rv.parada_id = p.id) AS visitado,
-           (SELECT CASE
-                WHEN rv.vendio = 1 THEN 'vendio'
-                WHEN COALESCE(rv.observaciones, '') LIKE '[no_estaba]%' THEN 'no_estaba'
-                WHEN COALESCE(rv.observaciones, '') LIKE '[reagendar]%' THEN 'reagendar'
-                WHEN COALESCE(rv.observaciones, '') LIKE '[vendio]%' THEN 'vendio'
-                ELSE NULL
-            END
-            FROM reportes_visita rv
-            WHERE rv.parada_id = p.id
-            ORDER BY rv.timestamp DESC LIMIT 1) AS resultado_visita,
-           (SELECT rv.vendio FROM reportes_visita rv
-            WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS vendio,
-           (SELECT rv.foto_url FROM reportes_visita rv
-            WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS foto_url
-    FROM paradas_ruta p WHERE p.ruta_id = %s ORDER BY p.orden
+SQL_PARADAS_BASE = """
+    SELECT id, nombre_ferreteria, direccion, latitud, longitud, orden
+    FROM paradas_ruta WHERE ruta_id = %s ORDER BY orden
 """
+
+
+def _resultado_desde_observaciones(observaciones, vendio=None):
+    obs = observaciones or ""
+    if vendio in (1, True, "1"):
+        return "vendio"
+    if obs.startswith("[no_estaba]"):
+        return "no_estaba"
+    if obs.startswith("[reagendar]"):
+        return "reagendar"
+    if obs.startswith("[vendio]"):
+        return "vendio"
+    return None
 
 
 def _resultado_desde_payload(data):
@@ -233,12 +231,67 @@ def _observaciones_con_resultado(resultado, observaciones):
 
 
 def _fetch_paradas_ruta(cur, ruta_id):
-    cur.execute(SQL_PARADAS_RUTA, (ruta_id,))
+    """Paradas de la ruta + estado de visita (evita subconsultas con columna `timestamp`)."""
+    cur.execute(SQL_PARADAS_BASE, (ruta_id,))
     out = []
     for p in cur.fetchall():
         row = serialize_row(p)
-        row["visitado"] = bool(row.get("visitado"))
+        row["visitado"] = False
+        row["resultado_visita"] = None
+        row["vendio"] = None
+        row["foto_url"] = None
         out.append(row)
+    if not out:
+        return out
+
+    ids = [r["id"] for r in out]
+    ph = ",".join(["%s"] * len(ids))
+
+    cur.execute(
+        f"SELECT parada_id, COUNT(*) AS cnt FROM reportes_visita "
+        f"WHERE parada_id IN ({ph}) GROUP BY parada_id",
+        ids,
+    )
+    counts = {r["parada_id"]: int(r["cnt"]) for r in cur.fetchall()}
+
+    latest_sql = (
+        f"SELECT rv.parada_id, rv.vendio, rv.observaciones, rv.foto_url, rv.resultado_visita "
+        f"FROM reportes_visita rv INNER JOIN ( "
+        f"  SELECT parada_id, MAX(`timestamp`) AS max_ts FROM reportes_visita "
+        f"  WHERE parada_id IN ({ph}) GROUP BY parada_id "
+        f") t ON t.parada_id = rv.parada_id AND rv.`timestamp` = t.max_ts "
+        f"WHERE rv.parada_id IN ({ph})"
+    )
+    latest_sql_fallback = (
+        f"SELECT rv.parada_id, rv.vendio, rv.observaciones, rv.foto_url "
+        f"FROM reportes_visita rv INNER JOIN ( "
+        f"  SELECT parada_id, MAX(`timestamp`) AS max_ts FROM reportes_visita "
+        f"  WHERE parada_id IN ({ph}) GROUP BY parada_id "
+        f") t ON t.parada_id = rv.parada_id AND rv.`timestamp` = t.max_ts "
+        f"WHERE rv.parada_id IN ({ph})"
+    )
+    params = ids + ids
+    try:
+        cur.execute(latest_sql, params)
+    except pymysql.err.OperationalError:
+        cur.execute(latest_sql_fallback, params)
+
+    latest = {r["parada_id"]: r for r in cur.fetchall()}
+    for row in out:
+        pid = row["id"]
+        row["visitado"] = bool(counts.get(pid, 0))
+        rep = latest.get(pid)
+        if not rep:
+            continue
+        rep = serialize_row(rep)
+        row["vendio"] = rep.get("vendio")
+        row["foto_url"] = rep.get("foto_url")
+        rv = rep.get("resultado_visita")
+        row["resultado_visita"] = (
+            rv
+            if rv
+            else _resultado_desde_observaciones(rep.get("observaciones"), rep.get("vendio"))
+        )
     return out
 
 
@@ -535,6 +588,9 @@ def ruta_asignada_vehiculo_hoy(vehiculo_id):
             "ruta": serialize_row(ruta) if ruta else None,
             "paradas": paradas,
         })
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
     finally:
         conn.close()
 
@@ -707,8 +763,11 @@ def ruta_asignada_hoy(conductor_id):
             paradas = _fetch_paradas_ruta(cur, ruta["id"]) if ruta else []
         return jsonify({
             "ruta": serialize_row(ruta) if ruta else None,
-            "paradas": paradas,
+            "paradas": [serialize_row(p) for p in paradas],
         })
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
     finally:
         conn.close()
 
@@ -757,6 +816,9 @@ def obtener_ruta_detalle(ruta_id):
         out = serialize_row(ruta)
         out["paradas"] = paradas
         return jsonify(out)
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
     finally:
         conn.close()
 
