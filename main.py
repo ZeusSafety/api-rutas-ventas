@@ -147,6 +147,27 @@ def get_conductor_info(conductor_id):
         conn.close()
 
 
+def get_vehiculo_asignado(conductor_id, fecha=None):
+    """Vehículo asignado al conductor en una fecha."""
+    fecha = fecha or date.today().isoformat()
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT v.id AS vehiculo_id, v.nombre AS vehiculo_nombre, v.placa, v.color
+                   FROM asignaciones_conductor ac
+                   JOIN vehiculos v ON v.id = ac.vehiculo_id
+                   WHERE ac.conductor_id = %s AND ac.fecha_asignacion = %s
+                   LIMIT 1""",
+                (conductor_id, fecha),
+            )
+            return cur.fetchone()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def estado_conductor(velocidad, ultimo_update_iso):
     if not ultimo_update_iso:
         return "sin_senal"
@@ -212,6 +233,244 @@ def list_conductores():
         return body, code
 
 
+# ─── Vehículos y flota ────────────────────────────────────────────────────────
+
+@app.route("/api/vehiculos", methods=["GET"])
+def list_vehiculos():
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, nombre, placa, color, activo
+                       FROM vehiculos WHERE activo = 1 ORDER BY nombre"""
+                )
+                rows = cur.fetchall()
+            return jsonify([serialize_row(r) for r in rows])
+        finally:
+            conn.close()
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+
+
+@app.route("/api/flota/en-vivo", methods=["GET"])
+def flota_en_vivo():
+    """Vehículos con conductor asignado hoy (panel lateral + mapa)."""
+    fecha = request.args.get("fecha", date.today().isoformat())
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT v.id AS vehiculo_id, v.nombre AS vehiculo_nombre,
+                              v.placa, v.color,
+                              c.id AS conductor_id, c.nombre AS conductor_nombre,
+                              r.id AS ruta_id, r.nombre_ruta, r.estado AS ruta_estado
+                       FROM vehiculos v
+                       LEFT JOIN asignaciones_conductor ac
+                         ON ac.vehiculo_id = v.id AND ac.fecha_asignacion = %s
+                       LEFT JOIN conductores c ON c.id = ac.conductor_id AND c.activo = 1
+                       LEFT JOIN rutas_asignadas r
+                         ON r.vehiculo_id = v.id AND r.fecha_asignacion = %s
+                       WHERE v.activo = 1
+                       ORDER BY v.nombre""",
+                    (fecha, fecha),
+                )
+                rows = cur.fetchall()
+            out = []
+            for row in rows:
+                item = serialize_row(row)
+                item["nombre"] = item.get("vehiculo_nombre") or ""
+                item["conductor_id"] = item.get("conductor_id")
+                out.append(item)
+            return jsonify(out)
+        finally:
+            conn.close()
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+
+
+@app.route("/api/asignacion", methods=["POST"])
+def asignar_conductor_vehiculo():
+    data = request.get_json() or {}
+    vehiculo_id = data.get("vehiculo_id")
+    conductor_id = data.get("conductor_id")
+    fecha = data.get("fecha", date.today().isoformat())
+    if not vehiculo_id or not conductor_id:
+        return jsonify({"error": "vehiculo_id y conductor_id requeridos"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO asignaciones_conductor (vehiculo_id, conductor_id, fecha_asignacion)
+                   VALUES (%s, %s, %s)
+                   ON DUPLICATE KEY UPDATE conductor_id = VALUES(conductor_id)""",
+                (vehiculo_id, conductor_id, fecha),
+            )
+        return jsonify({"ok": True, "vehiculo_id": vehiculo_id, "conductor_id": conductor_id, "fecha": fecha})
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+    finally:
+        conn.close()
+
+
+@app.route("/api/ruta/planificar", methods=["POST"])
+def planificar_ruta():
+    """Crea ruta planificada + paradas y asigna conductor al vehículo."""
+    data = request.get_json() or {}
+    vehiculo_id = data.get("vehiculo_id")
+    conductor_id = data.get("conductor_id")
+    nombre_ruta = (data.get("nombre_ruta") or "").strip()
+    fecha = data.get("fecha", date.today().isoformat())
+    paradas = data.get("paradas") or []
+
+    if not vehiculo_id or not conductor_id or not nombre_ruta:
+        return jsonify({"error": "vehiculo_id, conductor_id y nombre_ruta son requeridos"}), 400
+    if not paradas:
+        return jsonify({"error": "Agregue al menos una parada (ferretería)"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO asignaciones_conductor (vehiculo_id, conductor_id, fecha_asignacion)
+                   VALUES (%s, %s, %s)
+                   ON DUPLICATE KEY UPDATE conductor_id = VALUES(conductor_id)""",
+                (vehiculo_id, conductor_id, fecha),
+            )
+            cur.execute("SELECT color FROM vehiculos WHERE id = %s", (vehiculo_id,))
+            veh = cur.fetchone()
+            color = (veh or {}).get("color") or "#2563eb"
+
+            cur.execute(
+                """INSERT INTO rutas_asignadas
+                   (vehiculo_id, conductor_id, nombre_ruta, descripcion, fecha_asignacion, estado, color)
+                   VALUES (%s, %s, %s, %s, %s, 'pendiente', %s)""",
+                (
+                    vehiculo_id,
+                    conductor_id,
+                    nombre_ruta,
+                    data.get("descripcion"),
+                    fecha,
+                    color,
+                ),
+            )
+            ruta_id = cur.lastrowid
+
+            for i, p in enumerate(paradas):
+                cur.execute(
+                    """INSERT INTO paradas_ruta
+                       (ruta_id, nombre_ferreteria, direccion, latitud, longitud, orden)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        ruta_id,
+                        p.get("nombre_ferreteria") or p.get("nombre") or f"Parada {i + 1}",
+                        p.get("direccion"),
+                        p.get("latitud") or p.get("lat"),
+                        p.get("longitud") or p.get("lng"),
+                        p.get("orden", i + 1),
+                    ),
+                )
+
+        return jsonify({
+            "ok": True,
+            "ruta_id": ruta_id,
+            "vehiculo_id": vehiculo_id,
+            "conductor_id": conductor_id,
+            "fecha": fecha,
+        })
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+    finally:
+        conn.close()
+
+
+@app.route("/api/rutas/historial", methods=["GET"])
+def historial_rutas():
+    """Listado de todas las rutas planificadas (filtros opcionales)."""
+    fecha_desde = request.args.get("fecha_desde")
+    fecha_hasta = request.args.get("fecha_hasta")
+    vehiculo_id = request.args.get("vehiculo_id")
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            sql = """
+                SELECT r.id, r.nombre_ruta, r.descripcion, r.fecha_asignacion, r.estado, r.color,
+                       r.created_at,
+                       v.id AS vehiculo_id, v.nombre AS vehiculo_nombre,
+                       c.id AS conductor_id, c.nombre AS conductor_nombre,
+                       (SELECT COUNT(*) FROM paradas_ruta p WHERE p.ruta_id = r.id) AS total_paradas,
+                       (SELECT COUNT(DISTINCT rv.parada_id)
+                        FROM paradas_ruta p
+                        JOIN reportes_visita rv ON rv.parada_id = p.id
+                        WHERE p.ruta_id = r.id) AS paradas_visitadas
+                FROM rutas_asignadas r
+                LEFT JOIN vehiculos v ON v.id = r.vehiculo_id
+                LEFT JOIN conductores c ON c.id = r.conductor_id
+                WHERE 1=1
+            """
+            params = []
+            if fecha_desde:
+                sql += " AND r.fecha_asignacion >= %s"
+                params.append(fecha_desde)
+            if fecha_hasta:
+                sql += " AND r.fecha_asignacion <= %s"
+                params.append(fecha_hasta)
+            if vehiculo_id:
+                sql += " AND r.vehiculo_id = %s"
+                params.append(vehiculo_id)
+            sql += " ORDER BY r.fecha_asignacion DESC, r.id DESC LIMIT 500"
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return jsonify([serialize_row(r) for r in rows])
+    except Exception as e:
+        body, code = db_error_response(e)
+        return body, code
+    finally:
+        conn.close()
+
+
+@app.route("/api/ruta/asignada/vehiculo/<int:vehiculo_id>/hoy", methods=["GET"])
+def ruta_asignada_vehiculo_hoy(vehiculo_id):
+    fecha = request.args.get("fecha", date.today().isoformat())
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, nombre_ruta, descripcion, estado, color, fecha_asignacion, conductor_id
+                   FROM rutas_asignadas
+                   WHERE vehiculo_id = %s AND fecha_asignacion = %s
+                   ORDER BY id DESC LIMIT 1""",
+                (vehiculo_id, fecha),
+            )
+            ruta = cur.fetchone()
+            paradas = []
+            if ruta:
+                cur.execute(
+                    """SELECT p.id, p.nombre_ferreteria, p.direccion, p.latitud, p.longitud, p.orden,
+                              (SELECT COUNT(*) FROM reportes_visita rv WHERE rv.parada_id = p.id) AS visitado,
+                              (SELECT rv.vendio FROM reportes_visita rv
+                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS vendio,
+                              (SELECT rv.foto_url FROM reportes_visita rv
+                               WHERE rv.parada_id = p.id ORDER BY rv.timestamp DESC LIMIT 1) AS foto_url
+                       FROM paradas_ruta p WHERE p.ruta_id = %s ORDER BY p.orden""",
+                    (ruta["id"],),
+                )
+                paradas = cur.fetchall()
+        return jsonify({
+            "ruta": serialize_row(ruta) if ruta else None,
+            "paradas": [serialize_row(p) for p in paradas],
+        })
+    finally:
+        conn.close()
+
+
 # ─── Sesiones GPS ─────────────────────────────────────────────────────────────
 
 @app.route("/api/sesion/iniciar", methods=["POST"])
@@ -219,16 +478,21 @@ def iniciar_sesion():
     data = request.get_json() or {}
     conductor_id = data.get("conductor_id")
     ruta_asignada_id = data.get("ruta_asignada_id")
+    vehiculo_id = data.get("vehiculo_id")
     if not conductor_id:
         return jsonify({"error": "conductor_id requerido"}), 400
+
+    if not vehiculo_id:
+        veh = get_vehiculo_asignado(conductor_id)
+        vehiculo_id = veh["vehiculo_id"] if veh else None
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO sesiones_ruta (conductor_id, ruta_asignada_id, estado)
-                   VALUES (%s, %s, 'activa')""",
-                (conductor_id, ruta_asignada_id),
+                """INSERT INTO sesiones_ruta (conductor_id, vehiculo_id, ruta_asignada_id, estado)
+                   VALUES (%s, %s, %s, 'activa')""",
+                (conductor_id, vehiculo_id, ruta_asignada_id),
             )
             sesion_id = cur.lastrowid
             if ruta_asignada_id:
@@ -507,10 +771,12 @@ def ws_conductor(ws, conductor_id):
                 conn.close()
 
             estado = estado_conductor(velocidad, ultimo)
+            veh = get_vehiculo_asignado(conductor_id)
             update = {
                 "type": "ubicacion",
                 "conductor_id": conductor_id,
                 "nombre": conductor["nombre"],
+                "conductor_nombre": conductor["nombre"],
                 "placa": conductor.get("placa") or "",
                 "lat": float(lat),
                 "lng": float(lng),
@@ -518,6 +784,11 @@ def ws_conductor(ws, conductor_id):
                 "ultimo_update": ultimo,
                 "estado": estado,
             }
+            if veh:
+                update["vehiculo_id"] = veh["vehiculo_id"]
+                update["vehiculo_nombre"] = veh["vehiculo_nombre"]
+                update["nombre"] = veh["vehiculo_nombre"]
+                update["placa"] = veh.get("placa") or update["placa"]
             broadcast_to_panel(update)
             try:
                 ws.send(json.dumps({"ok": True}))
