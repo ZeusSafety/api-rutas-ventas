@@ -8,9 +8,7 @@ import os
 import threading
 from datetime import date, datetime
 from decimal import Decimal
-
 import pymysql
-logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -18,10 +16,70 @@ from flask_sock import Sock
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+###########################################################
+# CONFIG DB (mismo patrón que ejemplo.py / otros backends ZEUS)
+###########################################################
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
+INSTANCE_CONNECTION_NAME = os.getenv("INSTANCE_CONNECTION_NAME")
+# Solo desarrollo local con cloud-sql-proxy:
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
+PORT = int(os.getenv("PORT", "8080"))
+
+###########################################################
+# APP
+###########################################################
+
 app = Flask(__name__)
 sock = Sock(app)
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
-# Cloud Run health check / verificación rápida sin MySQL
+panel_connections = []
+panel_lock = threading.Lock()
+MAX_GPS_PRECISION_M = 50
+
+
+def get_connection():
+    """Igual que get_connection() en ejemplo.py — Cloud SQL por socket o TCP local."""
+    common = dict(
+        user=DB_USER,
+        password=DB_PASSWORD,
+        db=DB_NAME,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+        connect_timeout=15,
+        read_timeout=30,
+        write_timeout=30,
+    )
+
+    if INSTANCE_CONNECTION_NAME:
+        return pymysql.connect(
+            unix_socket=f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
+            **common,
+        )
+
+    if DB_HOST:
+        return pymysql.connect(host=DB_HOST, port=DB_PORT, **common)
+
+    raise RuntimeError(
+        "Defina INSTANCE_CONNECTION_NAME (Cloud Run) o DB_HOST (local + proxy)."
+    )
+
+
+def get_db():
+    return get_connection()
+
+
 @app.route("/")
 def root():
     return jsonify({
@@ -30,62 +88,12 @@ def root():
         "status": "ok",
     })
 
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-    if o.strip()
-]
-CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
-
-panel_connections = []
-panel_lock = threading.Lock()
-MAX_GPS_PRECISION_M = 50
-
-
-def get_db():
-    user = os.getenv("DB_USER", "root")
-    password = os.getenv("DB_PASSWORD", "")
-    database = os.getenv("DB_NAME", "Zeus_Safety_Data_Integration")
-    common = dict(
-        user=user,
-        password=password,
-        database=database,
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-        connect_timeout=15,
-        read_timeout=30,
-        write_timeout=30,
-    )
-
-    # Cloud Run + Cloud SQL (socket montado en /cloudsql/...)
-    cloud_instance = os.getenv("CLOUD_SQL_CONNECTION_NAME", "").strip()
-    host = (os.getenv("DB_HOST") or "").strip()
-
-    if cloud_instance:
-        socket_path = f"/cloudsql/{cloud_instance}"
-        return pymysql.connect(unix_socket=socket_path, **common)
-
-    if host.startswith("/cloudsql"):
-        return pymysql.connect(unix_socket=host, **common)
-
-    if not host:
-        raise RuntimeError(
-            "Configure CLOUD_SQL_CONNECTION_NAME (Cloud Run) o DB_HOST (local con proxy)."
-        )
-
-    # Local: cloud-sql-proxy en 127.0.0.1:3306
-    return pymysql.connect(
-        host=host,
-        port=int(os.getenv("DB_PORT", "3306")),
-        **common,
-    )
-
 
 def db_error_response(exc):
     """Respuesta JSON clara cuando falla MySQL (config o tablas)."""
     logger.exception("Error de base de datos")
     msg = str(exc)
-    hint = "Configure DB_HOST, DB_USER, DB_PASSWORD, DB_NAME en Cloud Run."
+    hint = "Defina DB_USER, DB_PASSWORD, DB_NAME e INSTANCE_CONNECTION_NAME en Cloud Run."
     if "doesn't exist" in msg.lower() or "1146" in msg:
         hint = "Ejecute database/migrations.sql en su MySQL."
     elif "Access denied" in msg or "1045" in msg:
@@ -528,5 +536,4 @@ except ImportError:
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
