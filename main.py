@@ -36,7 +36,10 @@ def _instance_connection_name():
 
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,https://zeus-safety.vercel.app",
+    ).split(",")
     if o.strip()
 ]
 PORT = int(os.getenv("PORT", "8080"))
@@ -47,7 +50,13 @@ PORT = int(os.getenv("PORT", "8080"))
 
 app = Flask(__name__)
 sock = Sock(app)
-CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# If deployer explicitly sets '*' allow all origins (no credentials),
+# otherwise restrict to configured origins and allow credentials.
+if any(o == "*" for o in ALLOWED_ORIGINS):
+    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+else:
+    CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
 
 panel_connections = []
 panel_lock = threading.Lock()
